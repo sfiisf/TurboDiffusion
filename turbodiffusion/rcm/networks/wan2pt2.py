@@ -575,6 +575,7 @@ class ParallelWanSelfAttention(nn.Module):
                     self_attn.v.bias.copy_(wan_self_attn.v.bias)
                 self_attn.o.int8_weight.copy_(wan_self_attn.o.int8_weight)
                 self_attn.o.bias.copy_(wan_self_attn.o.bias)
+                self_attn.o.scale.copy_(wan_self_attn.o.scale)
                 self_attn.norm_q.weight.copy_(wan_self_attn.norm_q.weight)
                 self_attn.norm_k.weight.copy_(wan_self_attn.norm_k.weight)
 
