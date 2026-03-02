@@ -279,6 +279,319 @@ class WanSelfAttention(nn.Module):
         self.attn_op.set_context_parallel_group(process_group, ranks, stream)
 
 
+from ops.core import Int8Linear, cdiv, int8_linear
+class ColumnLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, parallel_size=1):
+        assert out_features % parallel_size == 0, "out_features must be divisible by parallel_size"
+        super().__init__()
+        out_features = out_features // parallel_size
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, parallel_size=1):
+        column_linear = cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=(linear.bias is not None),
+            parallel_size=parallel_size
+        )
+        with torch.no_grad():
+            sz = linear.out_features // parallel_size
+            rank = distributed.get_rank()
+            column_linear.weight.copy_(linear.weight.data[rank * sz : (rank + 1) * sz, :])
+            if linear.bias is not None:
+                column_linear.bias.copy_(linear.bias.data[rank * sz : (rank + 1) * sz])
+        return column_linear
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+    
+class RowLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, parallel_size=1):
+        assert in_features % parallel_size == 0, "in_features must be divisible by parallel_size"
+        super().__init__()
+        in_features = in_features // parallel_size
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, parallel_size=1):
+        row_linear = cls(
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+            bias=(linear.bias is not None),
+            parallel_size=parallel_size
+        )
+        with torch.no_grad():
+            sz = linear.in_features // parallel_size
+            rank = distributed.get_rank()
+            row_linear.weight.copy_(linear.weight.data[:, rank * sz : (rank + 1) * sz])
+            if linear.bias is not None:
+                row_linear.bias.copy_(linear.bias.data)
+        return row_linear
+
+    def forward(self, x):
+        res = torch.nn.functional.linear(x, self.weight)
+        res = distributed.dist_all_reduce_tensor_sum(res)
+        if self.bias is not None:
+            res += self.bias
+        return res
+
+class ColumnLinearInt8(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16, parallel_size=1):
+        super().__init__()
+
+        assert parallel_size > 1 and out_features % parallel_size == 0, "Parallel size must be a positive integer that divides out_features evenly."
+        self.parallel_size = parallel_size
+        out_features = out_features // parallel_size
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        assert out_features % 128 == 0, "Parallel size must divide the number of column blocks evenly."
+        row_blocks = cdiv(out_features, b=128)
+        col_blocks = cdiv(in_features, b=128)
+        
+        self.register_buffer("int8_weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        self.register_buffer("scale", torch.empty((row_blocks, col_blocks), dtype=torch.float32))
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
+        else:
+            self.bias = None
+
+        self.rank = distributed.get_rank()
+
+    def forward(self, x):
+        out = int8_linear(x, self.int8_weight, self.scale)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+    
+    @classmethod
+    def from_Int8linear(cls, int8_linear_layer: Int8Linear, parallel_size: int = 1):
+        assert int8_linear_layer.out_features % parallel_size == 0, "Parallel size must divide out_features evenly."
+        int8_parallel_layer = cls(
+            in_features=int8_linear_layer.in_features,
+            out_features=int8_linear_layer.out_features,
+            bias=int8_linear_layer.bias is not None,
+            dtype=int8_linear_layer.bias.dtype if int8_linear_layer.bias is not None else torch.bfloat16,
+            parallel_size=parallel_size,
+        )
+        rank = distributed.get_rank()
+        device = int8_linear_layer.int8_weight.device
+        local_out_features = int8_linear_layer.out_features // parallel_size
+        w_local = int8_linear_layer.int8_weight.detach()
+        w_local = w_local[rank * local_out_features : (rank + 1) * local_out_features, :].contiguous().to(device)
+        scale_local = int8_linear_layer.scale.detach()
+        local_scale_features = scale_local.shape[0] // parallel_size
+        scale_local = scale_local[rank * local_scale_features : (rank + 1) * local_scale_features, :].contiguous().to(device)
+
+        int8_parallel_layer.int8_weight.copy_(w_local)
+        int8_parallel_layer.scale.copy_(scale_local)
+        if int8_linear_layer.bias is not None:
+            b_local = int8_linear_layer.bias.detach()
+            b_local = b_local[rank * local_out_features : (rank + 1) * local_out_features].contiguous().to(device)
+            int8_parallel_layer.bias.data.copy_(b_local)
+
+        return int8_parallel_layer
+
+class RowLinearInt8(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16, parallel_size=1):
+        super().__init__()
+
+        assert parallel_size > 1 and in_features % parallel_size == 0, "Parallel size must be a positive integer that divides in_features evenly."
+        self.parallel_size = parallel_size
+        in_features = in_features // parallel_size
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        assert in_features % 128 == 0, "Parallel size must divide the number of column blocks evenly."
+        row_blocks = cdiv(out_features, b=128)
+        col_blocks = cdiv(in_features, b=128)
+        
+        self.register_buffer("int8_weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        self.register_buffer("scale", torch.empty((row_blocks, col_blocks), dtype=torch.float32))
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
+        else:
+            self.bias = None
+
+        self.rank = distributed.get_rank()
+
+    def forward(self, x):
+        out = int8_linear(x, self.int8_weight, self.scale)
+        out = distributed.dist_all_reduce_tensor_sum(out)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+    
+    @classmethod
+    def from_Int8linear(cls, int8_linear_layer: Int8Linear, parallel_size: int = 1):
+        assert int8_linear_layer.in_features % parallel_size == 0, "Parallel size must divide in_features evenly."
+        int8_parallel_layer = cls(
+            in_features=int8_linear_layer.in_features,
+            out_features=int8_linear_layer.out_features,
+            bias=int8_linear_layer.bias is not None,
+            dtype=int8_linear_layer.bias.dtype if int8_linear_layer.bias is not None else torch.bfloat16,
+            parallel_size=parallel_size,
+        )
+        rank = distributed.get_rank()
+        device = int8_linear_layer.int8_weight.device
+        local_in_features = int8_linear_layer.in_features // parallel_size
+        w_local = int8_linear_layer.int8_weight.detach()
+        w_local = w_local[:, rank * local_in_features : (rank + 1) * local_in_features].contiguous().to(device)
+        scale_local = int8_linear_layer.scale.detach()
+        local_scale_features = scale_local.shape[1] // parallel_size
+        scale_local = scale_local[:, rank * (local_scale_features) : (rank + 1) * (local_scale_features)].contiguous().to(device)
+
+        int8_parallel_layer.int8_weight.copy_(w_local)
+        int8_parallel_layer.scale.copy_(scale_local)
+        if int8_linear_layer.bias is not None:
+            int8_parallel_layer.bias.data.copy_(int8_linear_layer.bias.data).to(device)
+
+        return int8_parallel_layer
+
+class ParallelWanSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads, qk_norm=True, eps=1e-6):
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qk_norm = qk_norm
+        self.eps = eps
+
+        # self.qkv = nn.Linear(dim, dim * 3)
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.attn_op = MinimalA2AAttnOp()
+
+    @classmethod
+    def from_wan_self_attention(cls, wan_self_attn: WanSelfAttention, parallel_size: int = 1):
+        self_attn = cls(
+            dim=wan_self_attn.dim,
+            num_heads=wan_self_attn.num_heads,
+            qk_norm=wan_self_attn.qk_norm,
+            eps=wan_self_attn.eps
+        )
+        
+        with torch.no_grad():
+            if isinstance(wan_self_attn.q, torch.nn.Linear):
+                # self_attn.qkv.weight.copy_(torch.cat([wan_self_attn.q.weight, wan_self_attn.k.weight, wan_self_attn.v.weight], dim=0))
+                # self_attn.qkv.bias.copy_(torch.cat([wan_self_attn.q.bias, wan_self_attn.k.bias, wan_self_attn.v.bias], dim=0))
+                self_attn.q.weight.copy_(wan_self_attn.q.weight)
+                self_attn.k.weight.copy_(wan_self_attn.k.weight)
+                self_attn.v.weight.copy_(wan_self_attn.v.weight)
+                self_attn.q.bias.copy_(wan_self_attn.q.bias)
+                self_attn.k.bias.copy_(wan_self_attn.k.bias)
+                self_attn.v.bias.copy_(wan_self_attn.v.bias)
+                self_attn.o.weight.copy_(wan_self_attn.o.weight)
+                self_attn.o.bias.copy_(wan_self_attn.o.bias)
+                self_attn.norm_q.weight.copy_(wan_self_attn.norm_q.weight)
+                self_attn.norm_k.weight.copy_(wan_self_attn.norm_k.weight)
+
+                if parallel_size > 1:
+                    # self_attn.qkv = ColumnLinear.from_linear(self_attn.qkv, parallel_size=parallel_size)
+                    self_attn.q = ColumnLinear.from_linear(self_attn.q, parallel_size=parallel_size)
+                    self_attn.k = ColumnLinear.from_linear(self_attn.k, parallel_size=parallel_size)
+                    self_attn.v = ColumnLinear.from_linear(self_attn.v, parallel_size=parallel_size)
+                    self_attn.o = RowLinear.from_linear(self_attn.o, parallel_size=parallel_size)
+                    self_attn.num_heads = self_attn.num_heads // parallel_size
+
+                    if wan_self_attn.qk_norm:
+                        self_attn.norm_q = ParallelWanRMSNorm.from_rmsnorm(wan_self_attn.norm_q, parallel_size=parallel_size)
+                        self_attn.norm_k = ParallelWanRMSNorm.from_rmsnorm(wan_self_attn.norm_k, parallel_size=parallel_size)
+            elif isinstance(wan_self_attn.q, Int8Linear):
+                # setattr(self_attn, "qkv", Int8Linear(wan_self_attn.q.in_features, wan_self_attn.q.out_features * 3, bias=(wan_self_attn.q.bias is not None)))
+                setattr(self_attn, "q", Int8Linear(wan_self_attn.q.in_features, wan_self_attn.q.out_features, bias=(wan_self_attn.q.bias is not None)))
+                setattr(self_attn, "k", Int8Linear(wan_self_attn.k.in_features, wan_self_attn.k.out_features, bias=(wan_self_attn.k.bias is not None)))
+                setattr(self_attn, "v", Int8Linear(wan_self_attn.v.in_features, wan_self_attn.v.out_features, bias=(wan_self_attn.v.bias is not None)))
+                setattr(self_attn, "o", Int8Linear(wan_self_attn.o.in_features, wan_self_attn.o.out_features, bias=(wan_self_attn.o.bias is not None)))
+                # self_attn.qkv.int8_weight.copy_(torch.cat([wan_self_attn.q.int8_weight, wan_self_attn.k.int8_weight, wan_self_attn.v.int8_weight], dim=0))
+                # self_attn.qkv.scale.copy_(torch.cat([wan_self_attn.q.scale, wan_self_attn.k.scale, wan_self_attn.v.scale], dim=0))
+                self_attn.q.int8_weight.copy_(wan_self_attn.q.int8_weight)
+                self_attn.q.scale.copy_(wan_self_attn.q.scale)
+                self_attn.k.int8_weight.copy_(wan_self_attn.k.int8_weight)
+                self_attn.k.scale.copy_(wan_self_attn.k.scale)
+                self_attn.v.int8_weight.copy_(wan_self_attn.v.int8_weight)
+                self_attn.v.scale.copy_(wan_self_attn.v.scale)
+                if wan_self_attn.q.bias is not None:
+                    # self_attn.qkv.bias.copy_(torch.cat([wan_self_attn.q.bias, wan_self_attn.k.bias, wan_self_attn.v.bias], dim=0))
+                    self_attn.q.bias.copy_(wan_self_attn.q.bias)
+                    self_attn.k.bias.copy_(wan_self_attn.k.bias)
+                    self_attn.v.bias.copy_(wan_self_attn.v.bias)
+                self_attn.o.int8_weight.copy_(wan_self_attn.o.int8_weight)
+                self_attn.o.bias.copy_(wan_self_attn.o.bias)
+                self_attn.norm_q.weight.copy_(wan_self_attn.norm_q.weight)
+                self_attn.norm_k.weight.copy_(wan_self_attn.norm_k.weight)
+
+                if parallel_size > 1:
+                    # self_attn.qkv = ColumnLinearInt8.from_Int8linear(self_attn.qkv, parallel_size=parallel_size)
+                    self_attn.q = ColumnLinearInt8.from_Int8linear(self_attn.q, parallel_size=parallel_size)
+                    self_attn.k = ColumnLinearInt8.from_Int8linear(self_attn.k, parallel_size=parallel_size)
+                    self_attn.v = ColumnLinearInt8.from_Int8linear(self_attn.v, parallel_size=parallel_size)
+                    self_attn.o = RowLinearInt8.from_Int8linear(self_attn.o, parallel_size=parallel_size)
+                    # setattr(self_attn, "qkv", ColumnLinearInt8.from_Int8linear(self_attn.qkv, parallel_size=parallel_size))
+                    # setattr(self_attn, "o", RowLinearInt8.from_Int8linear(self_attn.o, parallel_size=parallel_size))
+                    self_attn.num_heads = self_attn.num_heads // parallel_size
+
+                    if wan_self_attn.qk_norm:
+                        # self_attn.norm_q = ParallelWanRMSNorm.from_rmsnorm(wan_self_attn.norm_q, parallel_size=parallel_size)
+                        # self_attn.norm_k = ParallelWanRMSNorm.from_rmsnorm(wan_self_attn.norm_k, parallel_size=parallel_size)
+                        self_attn.norm_q = wan_self_attn.norm_q
+                        self_attn.norm_k = wan_self_attn.norm_k
+            else:
+                raise ValueError(f"Unsupported linear layer type: {type(wan_self_attn.q)}")
+        return self_attn
+
+    def forward(self, x, seq_lens, freqs):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, C]
+            seq_lens(Tensor): Shape [B]
+            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+        """
+        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+        # qkv = self.qkv(x)
+        # qkv = qkv.view(b, s, 3, n, d)
+        # q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
+
+        # q = self.norm_q(q.reshape(b, s, n * d).contiguous()).view(b, s, n, d)
+        # k = self.norm_k(k.reshape(b, s, n * d).contiguous()).view(b, s, n, d)
+
+        q = rope_apply(q, freqs)
+        k = rope_apply(k, freqs)
+
+        x = self.attn_op(q, k, v)
+
+        # output
+        x = x.flatten(2)
+        x = self.o(x)
+        return x
+
+
 class WanCrossAttention(WanSelfAttention):
     def forward(self, x, context, context_lens):
         r"""
