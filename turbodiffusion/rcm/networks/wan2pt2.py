@@ -41,6 +41,7 @@ from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outp
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
+from imaginaire.utils import distributed
 
 class VideoRopePosition3DEmb(nn.Module):
     def __init__(
@@ -198,6 +199,40 @@ class WanRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
+class ParallelWanRMSNorm(nn.Module):
+    def __init__(self, local_dim, global_dim, eps=1e-5):
+        super().__init__()
+        self.local_dim = local_dim
+        self.global_dim = global_dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(local_dim))
+
+    def reset_parameters(self):
+        self.weight.data.fill_(1.0)
+
+    def forward(self, x):
+        x_float = x.float()
+        local_sq_sum = x_float.pow(2).sum(dim=-1, keepdim=True)
+        global_sq_sum = local_sq_sum.clone()
+        distributed.dist_all_reduce_tensor_sum(global_sq_sum)
+        rms = torch.rsqrt(global_sq_sum / self.global_dim + self.eps)
+        res = (x_float * rms).type_as(x) * self.weight
+        return res.type_as(x)
+
+    @classmethod
+    def from_rmsnorm(cls, rmsnorm: WanRMSNorm, parallel_size=1):
+        global_dim = rmsnorm.dim
+        local_dim = global_dim // parallel_size
+        
+        parallel_norm = cls(
+            local_dim=local_dim,
+            global_dim=global_dim,
+            eps=rmsnorm.eps
+        )
+        with torch.no_grad():
+            rank = distributed.get_rank()
+            parallel_norm.weight.copy_(rmsnorm.weight.data[rank * local_dim : (rank + 1) * local_dim])
+        return parallel_norm
 
 class WanLayerNorm(nn.LayerNorm):
     def __init__(self, dim, eps=1e-6, elementwise_affine=False):
