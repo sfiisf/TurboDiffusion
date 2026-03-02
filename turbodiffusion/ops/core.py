@@ -431,6 +431,134 @@ class Int8Linear(nn.Module):
             
         return int8_layer
     
+from imaginaire.utils import distributed
+class ParallelInt8Linear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16, parallel_size=1):
+        super().__init__()
+
+        assert parallel_size > 1 and in_features % parallel_size == 0, "Parallel size must be a positive integer that divides in_features evenly."
+        self.parallel_size = parallel_size
+        in_features = in_features // parallel_size
+
+        self.in_features = in_features
+        self.out_features = out_features
+
+        assert in_features % 128 == 0, "Parallel size must divide the number of column blocks evenly."
+        row_blocks = cdiv(out_features, b=128)
+        col_blocks = cdiv(in_features, b=128)
+        
+        self.register_buffer("int8_weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        self.register_buffer("scale", torch.empty((row_blocks, col_blocks), dtype=torch.float32))
+        if bias:
+            self.register_buffer("bias", torch.empty(out_features, dtype=dtype))
+        else:
+            self.bias = None
+
+        self.rank = distributed.get_rank()
+
+    def forward(self, x):
+        sz = x.shape[-1] // self.parallel_size
+        x = x[..., sz * self.rank : sz * (self.rank + 1)].contiguous()
+        out = int8_linear(x, self.int8_weight, self.scale)
+        out = distributed.dist_all_reduce_tensor_sum(out)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+    
+    @classmethod
+    def from_linear(cls, original_linear: nn.Linear, quantize: bool = True, parallel_size: int = 1):
+        int8_layer = cls(
+            original_linear.in_features,
+            original_linear.out_features,
+            bias=original_linear.bias is not None,
+            dtype=original_linear.weight.dtype,
+            parallel_size=parallel_size,
+        )
+        
+        if quantize:
+            rank = distributed.get_rank()
+            device = original_linear.weight.device
+            w_local = original_linear.weight.detach()
+            local_in_features = original_linear.in_features // parallel_size
+            w_local = w_local[:, rank * local_in_features : (rank + 1) * local_in_features].contiguous().to(device)
+
+            int8_w, scale = int8_quant(w_local)
+            int8_layer.int8_weight.copy_(int8_w)
+            int8_layer.scale.copy_(scale)
+            if original_linear.bias is not None:
+                int8_layer.bias.data.copy_(original_linear.bias.data.to(device))
+
+        return int8_layer
+    
+    @classmethod
+    def from_Int8linear(cls, int8_linear_layer: Int8Linear, parallel_size: int = 1):
+        assert int8_linear_layer.in_features % parallel_size == 0, "Parallel size must divide in_features evenly."
+        int8_parallel_layer = cls(
+            in_features=int8_linear_layer.in_features,
+            out_features=int8_linear_layer.out_features,
+            bias=int8_linear_layer.bias is not None,
+            dtype=int8_linear_layer.bias.dtype if int8_linear_layer.bias is not None else torch.bfloat16,
+            parallel_size=parallel_size,
+        )
+        rank = distributed.get_rank()
+        device = int8_linear_layer.int8_weight.device
+        local_in_features = int8_linear_layer.in_features // parallel_size
+        w_local = int8_linear_layer.int8_weight.detach()
+        w_local = w_local[:, rank * local_in_features : (rank + 1) * local_in_features].contiguous().to(device)
+        scale_local = int8_linear_layer.scale.detach()
+        local_scale_features = scale_local.shape[1] // parallel_size
+        scale_local = scale_local[:, rank * (local_scale_features) : (rank + 1) * (local_scale_features)].contiguous().to(device)
+
+        int8_parallel_layer.int8_weight.copy_(w_local)
+        int8_parallel_layer.scale.copy_(scale_local)
+        if int8_linear_layer.bias is not None:
+            int8_parallel_layer.bias.data.copy_(int8_linear_layer.bias.data.to(device))
+
+        return int8_parallel_layer
+
+class ParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16, parallel_size=1):
+        super().__init__()
+
+        assert parallel_size > 1 and in_features % parallel_size == 0, "Parallel size must be a positive integer that divides in_features evenly."
+        self.parallel_size = parallel_size
+        in_features = in_features // parallel_size
+
+        self.linear = nn.Linear(in_features, out_features, bias=bias).to(dtype)
+
+        self.rank = distributed.get_rank()
+
+    def forward(self, x):
+        sz = x.shape[-1] // self.parallel_size
+        x = x[..., sz * self.rank : sz * (self.rank + 1)].contiguous()
+        out = self.linear(x)
+        out = distributed.dist_all_reduce_tensor_sum(out)
+        return out
+    
+    @classmethod
+    def from_linear(cls, original_linear: nn.Linear, parallel_size: int = 1):
+        linear_layer = cls(
+            original_linear.in_features,
+            original_linear.out_features,
+            bias=original_linear.bias is not None,
+            dtype=original_linear.weight.dtype,
+            parallel_size=parallel_size,
+        )
+        
+        rank = distributed.get_rank()
+        device = original_linear.weight.device
+        local_in_features = original_linear.in_features // parallel_size
+        w_local = original_linear.weight.detach()[:, rank * local_in_features : (rank + 1) * local_in_features].contiguous().to(device)
+        linear_layer.linear.weight.data.copy_(w_local)
+        if original_linear.bias is not None:
+            if rank == 0:
+                linear_layer.linear.bias.data.copy_(original_linear.bias.data.to(device))
+            else:
+                linear_layer.linear.bias.data.zero_()
+
+        return linear_layer
+
+
 class FastRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()

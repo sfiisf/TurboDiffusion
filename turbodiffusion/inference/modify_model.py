@@ -30,7 +30,7 @@ from rcm.networks.wan2pt2 import (
     WanSelfAttention as WanSelfAttention2pt2
 )
 
-from ops import FastLayerNorm, FastRMSNorm, Int8Linear
+from ops import FastLayerNorm, FastRMSNorm, Int8Linear, ParallelInt8Linear, ParallelLinear
 from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
@@ -74,6 +74,28 @@ def replace_linear_norm(
 
     for name, new_module in replacements.items():
         parent_module = model.blocks
+        name_parts = name.split(".")
+        for part in name_parts[:-1]:
+            parent_module = getattr(parent_module, part)
+        setattr(parent_module, name_parts[-1], new_module)
+    return model
+
+def replace_parallel_linear(
+    model: torch.nn.Module,
+    parallel_size: int = 1,
+):
+    replacements = {}
+    for name, module in model.named_modules():
+        if "proj_l" in name:
+            continue
+        if isinstance(module, Int8Linear):
+            replacements[name] = ParallelInt8Linear.from_Int8linear(module, parallel_size=parallel_size)
+            # pass
+        elif isinstance(module, torch.nn.Linear):
+            replacements[name] = ParallelLinear.from_linear(module, parallel_size=parallel_size)
+
+    for name, new_module in replacements.items():
+        parent_module = model
         name_parts = name.split(".")
         for part in name_parts[:-1]:
             parent_module = getattr(parent_module, part)
